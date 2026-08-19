@@ -180,6 +180,9 @@ measure_stage() {
 
   local timing_dir
   timing_dir=$(mktemp -d)
+  # The container runs as uid 1001; the bind mount is created by the host user,
+  # so it needs to be writable by both for the fd3 timing capture to work.
+  chmod 777 "$timing_dir"
 
   local ini_pkg ini_cores ini_gpu ini_ram
   ini_pkg=$(read_rapl pkg)
