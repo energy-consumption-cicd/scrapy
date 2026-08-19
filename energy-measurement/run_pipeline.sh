@@ -325,6 +325,6 @@ rm -f "$TIME_FILE"
 
 if [ "$PIPELINE_EXIT" -ne 0 ]; then
   echo "Run $RUN_NUM: stage(s) with non-zero exit  $FAILED_STAGES"
-  echo "  CSV: $CSV_FILE · exit codes: $EXITS_FILE"
+  echo "  CSV: $CSV_FILE  exit codes: $EXITS_FILE"
   exit "$PIPELINE_EXIT"
 fi
