@@ -22,6 +22,7 @@ MEM_LIMIT="${MEM_LIMIT:-12g}"
 MEM_SWAP="${MEM_SWAP:-$MEM_LIMIT}"
 
 SWAP_WARN_PAGES="${SWAP_WARN_PAGES:-256}"
+BASELINE_WARN_W="${BASELINE_WARN_W:-1.0}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -161,12 +162,23 @@ taxa_cores=$(awk "BEGIN {printf \"%.6f\", $b_delta_cores / $BASELINE_DURATION}")
 taxa_gpu=$(awk  "BEGIN {printf \"%.6f\", $b_delta_gpu  / $BASELINE_DURATION}")
 taxa_ram=$(awk  "BEGIN {printf \"%.6f\", $b_delta_ram  / $BASELINE_DURATION}")
 
-echo "Baseline rate:"
-echo "   pkg:   $(awk "BEGIN {printf \"%.2f\", $taxa_pkg / 1e6}") W"
-echo "   cores: $(awk "BEGIN {printf \"%.2f\", $taxa_cores / 1e6}") W"
-echo "   ram:   $(awk "BEGIN {printf \"%.2f\", $taxa_ram / 1e6}") W"
+# Recorded per run: the rate drives the subtraction, so it has to be auditable
+# alongside the energy it produced.
+taxa_pkg_w=$(awk   "BEGIN {printf \"%.6f\", $taxa_pkg   / 1e6}")
+taxa_cores_w=$(awk "BEGIN {printf \"%.6f\", $taxa_cores / 1e6}")
+taxa_ram_w=$(awk   "BEGIN {printf \"%.6f\", $taxa_ram   / 1e6}")
 
-echo "run,stage,energy_pkg_j,energy_cores_j,energy_gpu_j,energy_ram_j,wall_time_s,user_time_s,sys_time_s,energy_ram_liquid_raw_j,wall_time_container_s,swap_in_pages,swap_out_pages" \
+echo "Baseline rate:"
+echo "   pkg:   $(awk "BEGIN {printf \"%.2f\", $taxa_pkg_w}") W"
+echo "   cores: $(awk "BEGIN {printf \"%.2f\", $taxa_cores_w}") W"
+echo "   ram:   $(awk "BEGIN {printf \"%.2f\", $taxa_ram_w}") W"
+
+if [ "$(awk "BEGIN {print ($taxa_pkg_w > $BASELINE_WARN_W)}")" = "1" ]; then
+  echo "  HOST NOT IDLE: baseline pkg rate ${taxa_pkg_w} W > ${BASELINE_WARN_W} W"
+  echo "::warning title=Baseline window not idle::Run $RUN_NUM: baseline_rate_pkg_w=${taxa_pkg_w} W (> ${BASELINE_WARN_W} W). RAPL covers the whole host, so concurrent load inflates the rate and the subtraction over-removes. Run suspect for over-subtraction - review before including it in the valid set."
+fi
+
+echo "run,stage,energy_pkg_j,energy_cores_j,energy_gpu_j,energy_ram_j,wall_time_s,user_time_s,sys_time_s,energy_ram_liquid_raw_j,wall_time_container_s,swap_in_pages,swap_out_pages,baseline_rate_pkg_w,baseline_rate_cores_w,baseline_rate_ram_w" \
   > "$CSV_FILE"
 
 total_pkg=0; total_cores=0; total_gpu=0; total_ram=0; total_ram_raw=0
@@ -265,6 +277,20 @@ measure_stage() {
 
   echo "  ram: delta=${d_ram}uJ baseline=$(awk "BEGIN {printf \"%.0f\", $taxa_ram * $wall}")uJ net=$(awk "BEGIN {printf \"%.3f\", ($d_ram - $taxa_ram * $wall) / 1e6}")J clamped=${j_ram}J"
 
+  # A domain floored at zero is over-subtraction, not a stage that spent nothing;
+  # without this the clamp is indistinguishable from a legitimate reading.
+  local clamped=""
+  for dom in pkg cores gpu ram; do
+    local d_var="d_$dom" t_var="taxa_$dom"
+    if [ "$(awk "BEGIN {print ((${!d_var}) - (${!t_var}) * $wall) < 0}")" = "1" ]; then
+      clamped="${clamped:+$clamped }$dom"
+    fi
+  done
+  if [ -n "$clamped" ] && [ "$(awk "BEGIN {print ($wall > 1)}")" = "1" ]; then
+    echo "  BASELINE OVER-SUBTRACTION in stage '$stage': domain(s) floored at zero: $clamped"
+    echo "::warning title=Baseline over-subtraction::Run $RUN_NUM, stage '$stage': domain(s) $clamped went negative before the max(.,0) floor (baseline rate ${taxa_pkg_w} W over ${wall}s). The reported zero is a clamp, not a measurement - run suspect."
+  fi
+
   if [ "$swap_out" -gt "$SWAP_WARN_PAGES" ]; then
     echo "  HOST PAGING in stage '$stage': swap_out_pages=$swap_out (swap_in_pages=$swap_in)"
     echo "::warning title=Host paging during measurement::Run $RUN_NUM, stage '$stage': swap_out_pages=$swap_out (> $SWAP_WARN_PAGES pages = $((SWAP_WARN_PAGES*4/1024)) MiB). The host was under memory pressure inside the measured window (the container itself cannot page: memory.swap.max=0). Run suspect for I/O contention - review before including it in the valid set."
@@ -272,7 +298,7 @@ measure_stage() {
     echo "  swap_out_pages=$swap_out (below the $SWAP_WARN_PAGES threshold - noise, no alert)"
   fi
 
-  echo "$RUN_NUM,$stage,$j_pkg,$j_cores,$j_gpu,$j_ram,$wall,$user_t,$sys_t,$j_ram_raw,$wall_container_t,$swap_in,$swap_out" >> "$CSV_FILE"
+  echo "$RUN_NUM,$stage,$j_pkg,$j_cores,$j_gpu,$j_ram,$wall,$user_t,$sys_t,$j_ram_raw,$wall_container_t,$swap_in,$swap_out,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w" >> "$CSV_FILE"
 
   total_pkg=$(awk   "BEGIN {printf \"%.6f\", $total_pkg   + $j_pkg}")
   total_cores=$(awk "BEGIN {printf \"%.6f\", $total_cores + $j_cores}")
@@ -292,7 +318,7 @@ measure_stage() {
 measure_stage build
 measure_stage test
 
-echo "$RUN_NUM,total,$total_pkg,$total_cores,$total_gpu,$total_ram,$total_wall,$total_user,$total_sys,$total_ram_raw,$total_wall_container,$total_swap_in,$total_swap_out" \
+echo "$RUN_NUM,total,$total_pkg,$total_cores,$total_gpu,$total_ram,$total_wall,$total_user,$total_sys,$total_ram_raw,$total_wall_container,$total_swap_in,$total_swap_out,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w" \
   >> "$CSV_FILE"
 
 echo ""
