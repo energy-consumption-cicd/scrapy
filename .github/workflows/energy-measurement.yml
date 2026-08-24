@@ -109,7 +109,7 @@ jobs:
           if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
             mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
                   "$RESULTS_DIR/validacao/exit_codes_run_00.txt"
-            echo "exit_codes_run_00.txt movido junto (par CSV+sidecar preservado)"
+            echo "exit_codes_run_00.txt moved along (CSV+sidecar pair preserved)"
           fi
 
           if ! validate_csv "$RESULTS_DIR/validacao/run_00.csv"; then
@@ -132,7 +132,7 @@ jobs:
           awk -F, -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
             NR==1 { next }
             NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
-              printf "::warning::[run 0] stage %s: swap_out_pages=%s (swap_in_pages=%s, limiar %s) - host paging occurred inside the measured window; run suspect for I/O contention\n", $2, $13, $12, LIMIAR
+              printf "::warning::[run 0] stage %s: swap_out_pages=%s (swap_in_pages=%s, threshold %s) - host paging occurred inside the measured window; run suspect for I/O contention\n", $2, $13, $12, LIMIAR
             }
           ' "$RESULTS_DIR/validacao/run_00.csv"
 
@@ -141,6 +141,22 @@ jobs:
         run: |
           RESULTS_DIR="$HOME/experimentos/medicao/resultados/scrapy/runs"
           PIPELINE="$HOME/experimentos/medicao/repositorios/scrapy/run_pipeline.sh"
+
+          # A campaign is one continuous session under one set of bench
+          # conditions; adopting a CSV written by an earlier session mixes them.
+          EXISTING=""
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            if [ -f "$RESULTS_DIR/run_${NN}.csv" ]; then
+              EXISTING="${EXISTING:+$EXISTING }$NN"
+            fi
+          done
+          if [ -n "$EXISTING" ]; then
+            echo "::error title=Results directory not empty::run CSV(s) already present: $EXISTING. A campaign is a single continuous session - every run must come from the same bench conditions, so no pre-existing result is ever reused. Archive the previous results under runs/descartados_<reason>_<date>/ and dispatch again."
+            echo "- **Campaign refused** - pre-existing run CSV(s): $EXISTING. Archive them before dispatching." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
           # Ensure no validation run_00.csv pollutes the median.
           rm -f "$RESULTS_DIR/run_00.csv"
 
@@ -193,76 +209,70 @@ jobs:
             awk -F, -v origin="$origin" -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
               NR==1 { next }
               NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
-                printf "::warning::[%s] stage %s: swap_out_pages=%s (swap_in_pages=%s, limiar %s) - host paging occurred inside the measured window; run suspect for I/O contention\n", origin, $2, $13, $12, LIMIAR
+                printf "::warning::[%s] stage %s: swap_out_pages=%s (swap_in_pages=%s, threshold %s) - host paging occurred inside the measured window; run suspect for I/O contention\n", origin, $2, $13, $12, LIMIAR
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # RAPL covers the whole host, so load during the baseline window inflates
+          # the rate and the subtraction removes more than the stage spent.
+          warn_baseline() {
+            local csv="$1" origin="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origin="$origin" -v LIMIAR="${BASELINE_WARN_W:-1.0}" '
+              NR==1 { next }
+              NF >= 16 && $2=="total" && $14+0 > LIMIAR {
+                printf "::warning::[%s] baseline_rate_pkg_w=%s W (threshold %s) - the host was not idle during the baseline window; run suspect for over-subtraction\n", origin, $14, LIMIAR
               }
             ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
             return 0
           }
 
           # Discarded warm-up convention: 11 runs, median over the 10 valid ones.
-          PENDING=0
-          for i in $(seq 1 10); do
-            validate_csv "$RESULTS_DIR/run_$(printf '%02d' "$i").csv" || PENDING=$((PENDING+1))
-          done
-          if [ "$PENDING" -gt 0 ]; then
-            echo "::group::Warm-up (discarded from analysis)"
-            echo "$PENDING pending run(s) - executing warm-up before official runs"
-            mkdir -p "$RESULTS_DIR/warmup"
-            WARMUP_EXIT=0
-            T_INI=$(agora_utc)
-            bash "$PIPELINE" 0 || WARMUP_EXIT=$?
-            echo "00,$T_INI,$(agora_utc),$WARMUP_EXIT,warmup" >> "$ORDEM"
-            if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
-              echo "::error title=Measurement failure::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) did not write run_00.csv - measurement failure, aborting the campaign"
-              exit 1
-            fi
-            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
-            if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
-              mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
-                    "$RESULTS_DIR/warmup/exit_codes_run_warmup.txt"
-            fi
-            if [ "$WARMUP_EXIT" -ne 0 ]; then
-              echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited $WARMUP_EXIT; expected 0. Warm-up is discarded data; the campaign continues"
-            fi
-            warn_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
-            warn_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
-            {
-              echo "## Warm-up executed and DISCARDED (not in the median)"
-              echo "- $PENDING pending run(s) this session; CSV at \`runs/warmup/run_warmup.csv\` (overwritten each session)"
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::endgroup::"
-            echo "Post-warm-up rest (120s)..."
-            sleep 120
-          else
-            echo "Campaign already complete (10 valid runs) - warm-up not needed"
-            echo "## Warm-up skipped - campaign already complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "::group::Warm-up (discarded from analysis)"
+          mkdir -p "$RESULTS_DIR/warmup"
+          WARMUP_EXIT=0
+          T_INI=$(agora_utc)
+          bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+          echo "00,$T_INI,$(agora_utc),$WARMUP_EXIT,warmup" >> "$ORDEM"
+          if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
+            echo "::error title=Measurement failure::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) did not write run_00.csv - measurement failure, aborting the campaign"
+            exit 1
           fi
+          mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+          if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+            mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                  "$RESULTS_DIR/warmup/exit_codes_run_warmup.txt"
+          fi
+          if [ "$WARMUP_EXIT" -ne 0 ]; then
+            echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited $WARMUP_EXIT; expected 0. Warm-up is discarded data; the campaign continues"
+          fi
+          warn_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+          warn_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+          warn_baseline "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+          {
+            echo "## Warm-up executed and DISCARDED (not in the median)"
+            echo "- CSV at \`runs/warmup/run_warmup.csv\` (overwritten each session)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+          echo "Post-warm-up rest (120s)..."
+          sleep 120
 
-          echo "## Execution (full mode) - skip-if-exists" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Execution (full mode) - every run executed in this session" >> "$GITHUB_STEP_SUMMARY"
           for i in $(seq 1 10); do
             NN=$(printf '%02d' "$i")
             CSV="$RESULTS_DIR/run_${NN}.csv"
             echo "::group::Run $i of 10"
-            if validate_csv "$CSV"; then
-              echo "Run $NN already exists and is valid - skipping"
-              echo "- Run $NN: already valid - **skipped**" >> "$GITHUB_STEP_SUMMARY"
-              echo "::endgroup::"
-              continue
-            fi
-            if [ -f "$CSV" ]; then
-              echo "Run $NN incomplete/invalid - re-executing (overwrite)"
-              echo "- Run $NN: invalid/incomplete CSV - **re-executed**" >> "$GITHUB_STEP_SUMMARY"
-              rm -f "$CSV"
-            else
-              echo "Run $NN missing - executing"
-              echo "- Run $NN: missing - **executed**" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            echo "Run $NN - executing"
+            echo "- Run $NN: **executed**" >> "$GITHUB_STEP_SUMMARY"
             RUN_EXIT=0
             T_INI=$(agora_utc)
             bash "$PIPELINE" "$i" || RUN_EXIT=$?
             echo "$NN,$T_INI,$(agora_utc),$RUN_EXIT,campanha" >> "$ORDEM"
             warn_user_sys "$CSV" "run $NN"
             warn_swap "$CSV" "run $NN"
+            warn_baseline "$CSV" "run $NN"
             if ! validate_csv "$CSV"; then
               echo "::error title=Measurement failure::run $NN: CSV missing or invalid after the pipeline (exit=$RUN_EXIT). Energy/wall unusable - aborting the campaign"
               echo "- Run $NN: **MEASUREMENT FAILURE** (pipeline exit=$RUN_EXIT) - campaign aborted" >> "$GITHUB_STEP_SUMMARY"
@@ -279,11 +289,12 @@ jobs:
             fi
           done
 
-          # Final sweep also covers pre-existing runs skipped above.
+          # Final sweep: re-emits every warning of the session as one block for review.
           for i in $(seq 1 10); do
             NN=$(printf '%02d' "$i")
             warn_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
             warn_swap "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+            warn_baseline "$RESULTS_DIR/run_${NN}.csv" "run $NN"
           done
 
           INVALIDAS=""
