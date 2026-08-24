@@ -106,11 +106,23 @@ One CSV per run, one row per stage plus a `total` row:
 ```
 run, stage, energy_pkg_j, energy_cores_j, energy_gpu_j, energy_ram_j,
 wall_time_s, user_time_s, sys_time_s, energy_ram_liquid_raw_j,
-wall_time_container_s, swap_in_pages, swap_out_pages
+wall_time_container_s, swap_in_pages, swap_out_pages,
+baseline_rate_pkg_w, baseline_rate_cores_w, baseline_rate_ram_w
 ```
 
 The first nine columns are the official schema shared by every project in the
-study. The last four are diagnostic and stay out of the reported analysis.
+study. The last seven are diagnostic and stay out of the reported analysis:
+
+- `energy_ram_liquid_raw_j` - RAM energy before the `max(.,0)` floor; a negative
+  value is the auditable record of baseline over-subtraction.
+- `wall_time_container_s` - wall time measured inside the container.
+- `swap_in_pages`, `swap_out_pages` - host paging inside the measured window.
+- `baseline_rate_pkg_w`, `baseline_rate_cores_w`, `baseline_rate_ram_w` - the
+  idle rate subtracted from every stage of the run. One baseline is measured per
+  run, so the value repeats on the `build`, `test` and `total` rows. RAPL covers
+  the whole host, so a rate above `BASELINE_WARN_W` (default 1.0 W) means the
+  host was not idle and the run is suspect for over-subtraction.
+
 Exit codes are written to a sidecar `exit_codes_run_NN.txt`.
 
 ## Reproducibility notes
